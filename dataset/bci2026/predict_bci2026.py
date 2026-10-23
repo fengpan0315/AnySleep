@@ -2,8 +2,8 @@
 Batch sleep-stage inference for the BCI 2026 competition.
 
 Reads every EDF file from a (read-only) input directory, predicts one sleep
-stage per 30 s epoch with the AnySleep model, and writes one same-named UTF-8
-JSON file per EDF into the output directory:
+stage per 30 s epoch with the U-Sleep model (2-channel EEG + EOG input), and
+writes one same-named UTF-8 JSON file per EDF into the output directory:
 
     {"Sleep": [{"time": "2026-01-01 23:59:30", "period": 0}, ...]}
 
@@ -19,9 +19,12 @@ postprocess_periods), enabled by default; --no-postprocess skips it.
 
 Preprocessing (identical to prepare_bci2026.py and the training pipeline,
 same as examples/predict_edf_file_logits_plain.py):
-    EEG + EOG-R + EOG-L read via pyedflib (physical calibration from the EDF
+    EEG + EOG-R read via pyedflib (physical calibration from the EDF
     header; the signals are already 0.1-35 Hz bandpassed and 50 Hz notched;
-    M1 and ECG are not used, AnySleep only supports EEG/EOG channels)
+    M1 and ECG are not used, and EOG-L is available in the EDFs but not
+    loaded: U-Sleep takes exactly 2 channels, EEG first and EOG second,
+    the same pair as the exp001a U-Sleep training data in
+    prepare_bci2026.py)
     -> trim to whole 30 s epochs from the EDF start
     -> resample_poly to 128 Hz (model input rate)
     -> clip to +/- 20 x global IQR per channel
@@ -58,14 +61,15 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parents[2]  # .../AnySleep
 
-# checkpoints live in bci2026_models/ next to the AnySleep repo (outside it,
-# i.e. in REPO_ROOT.parent), so they never show up in the repository
-DEFAULT_MODEL = (
-    REPO_ROOT.parent / "bci2026_models" / "exp002a-anysleep-2026-10-21_15-54-36-final.pth"
-)
+# default checkpoint: the U-Sleep model published with the repo (the same
+# weights used by examples/anphy/predict_anphy_usleep.py). Pass --model to
+# use another U-Sleep checkpoint, e.g. a bci2026-trained one saved into
+# bci2026_models/ next to the repo as exp001a-usleep-<timestamp>-final.pth
+DEFAULT_MODEL = REPO_ROOT.parent / "bci2026_models" / "exp001a-usleep-2026-10-23_10-52-18-final.pth"
 
+# U-Sleep input: exactly 2 channels, (EEG, EOG) in this order
 EEG_CHANNELS = ["EEG"]
-EOG_CHANNELS = ["EOG-R", "EOG-L"]
+EOG_CHANNELS = ["EOG-R"]
 SAMPLE_RATE = 128  # model input sample rate, Hz
 EPOCH_DURATION = 30  # sleep epoch duration, s
 MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold
@@ -108,7 +112,7 @@ def load_psg(edf_path):
                 f"{sfreqs}"
             )
         sfreq = int(sfreqs.pop())
-        psg = np.stack([f.readSignal(label_to_ind[chan]) for chan in channels], axis=1)
+        psg = np.stack([f.readSignal(label_to_ind[chan]) / 1.0e6 for chan in channels], axis=1)
         start = f.getStartdatetime()
     finally:
         f.close()
@@ -430,17 +434,22 @@ def run_inference(args):
 
     sys.path.insert(0, str(REPO_ROOT / "examples"))
     try:
-        from anysleep_no_hydra import AnySleep
+        from usleep_no_hydra import USleep
     except ImportError:
         sys.exit(
-            f"error: cannot import anysleep_no_hydra; expected at "
-            f"{REPO_ROOT / 'examples' / 'anysleep_no_hydra.py'}"
+            f"error: cannot import usleep_no_hydra; expected at "
+            f"{REPO_ROOT / 'examples' / 'usleep_no_hydra.py'}"
         )
 
     device = args.device
     print(f"Model:   {args.model}")
     print(f"Device:  {device}")
-    model = AnySleep(path=args.model, sleep_stage_frequency=1)
+    # U-Sleep consumes (batch, time, 2) with the 2 channels EEG + EOG
+    # (EEG_CHANNELS + EOG_CHANNELS above) and outputs 5 logits per epoch in
+    # the repo's stage encoding (config/base_config.yaml data.stages:
+    # 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM), which is identical to STAGE_MAP, so
+    # the argmax labels need no remapping.
+    model = USleep(path=args.model, sleep_stage_frequency=1)
     model.eval().to(device)
 
     input_dir = Path(args.input_dir)
@@ -449,6 +458,8 @@ def run_inference(args):
     )
     if not edf_files:
         sys.exit(f"error: no EDF files found in {input_dir}")
+    if args.limit:
+        edf_files = edf_files[: args.limit]
     print(f"Input:   {input_dir} ({len(edf_files)} EDF files)")
 
     output_dir = Path(args.output_dir)
@@ -525,7 +536,7 @@ def main():
     )
     parser.add_argument("--input-dir", default="/input", help="read-only EDF directory")
     parser.add_argument("--output-dir", default="/output", help="JSON output directory")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="AnySleep checkpoint")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="U-Sleep checkpoint")
     parser.add_argument("--device", default="cpu", help="cuda or cpu (default: cpu)")
     parser.add_argument(
         "--truth-dir",
@@ -541,6 +552,12 @@ def main():
         "--no-postprocess",
         action="store_true",
         help="write raw model predictions, skip the default rule-based repairs",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="process only the first N EDF files (default: 0 = all of them)",
     )
     args = parser.parse_args()
 

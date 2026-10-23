@@ -47,13 +47,13 @@ DATASET_NAME = "bci2026"
 SAMPLE_RATE = 128  # output sample rate of the signals, in Hz
 EPOCH_DURATION = 30  # sleep epoch duration, in seconds
 EEG_CHANNELS = ["EEG"]
-EOG_CHANNELS = ["EOG-R", "EOG-L"]
+EOG_CHANNELS = ["EOG-R"]
 # stage encoding of Sleep-Datasets (general.stages / general.rstages)
 STAGE_MAP = {"W": 0, "N1": 1, "N2": 2, "N3": 3, "REM": 4}
 MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold, see preprocess.yaml
 # split settings, see config/dataset/_base_dataset.yaml
-TEST_FRACTION = 0.02
-VALIDATION_FRACTION = 0.18
+TEST_FRACTION = 0.00
+VALIDATION_FRACTION = 0.10
 SEED = 42
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -153,7 +153,7 @@ def load_psg(edf_path):
                 f"{edf_path}: selected channels have mixed/unknown sample rates: {sfreqs}"
             )
         sfreq = int(sfreqs.pop())
-        psg = np.stack([f.readSignal(label_to_ind[chan]) for chan in channels], axis=1)
+        psg = np.stack([f.readSignal(label_to_ind[chan]) / 1.0e6 for chan in channels], axis=1)
         start = f.getStartdatetime()
     finally:
         f.close()
