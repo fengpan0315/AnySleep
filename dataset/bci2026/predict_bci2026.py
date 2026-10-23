@@ -2,7 +2,8 @@
 Batch sleep-stage inference for the BCI 2026 competition.
 
 Reads every EDF file from a (read-only) input directory, predicts one sleep
-stage per 30 s epoch with the AnySleep model (EEG + M1 + EOG-R input), and
+stage per 30 s epoch with the AnySleep model (EEG + M1 + EOG-R + EOG-L input),
+and
 writes one same-named UTF-8 JSON file per EDF into the output directory:
 
     {"Sleep": [{"time": "2026-01-01 23:59:30", "period": 0}, ...]}
@@ -17,14 +18,15 @@ no trimming, and no statistics are carried across records. The raw argmax
 hypnograms are then repaired by rule-based post-processing (see
 postprocess_periods), enabled by default; --no-postprocess skips it.
 
-Preprocessing (identical to prepare_bci2026.py and the training pipeline,
-same as examples/predict_edf_file_logits_plain.py):
-    EEG + M1 + EOG-R read via pyedflib (physical calibration from the EDF
-    header; EEG and M1 form the EEG group and EOG-R the EOG group, the
-    same set and order as the training data written by prepare_bci2026.py;
-    EOG-L and ECG are not used)
+Preprocessing (identical to the training pipeline, shared with
+prepare_bci2026.py in bci2026_common.py, same as
+examples/predict_edf_file_logits_plain.py):
+    EEG + M1 + EOG-R + EOG-L read via pyedflib (physical calibration from
+    the EDF header; EEG and M1 form the EEG group and EOG-R and EOG-L the
+    EOG group, the same set and order as the training data written by
+    prepare_bci2026.py; ECG is not used)
     -> trim to whole 30 s epochs from the EDF start
-    -> bandpass 0.5-16 Hz FIR at the original rate (psg_utils apply_filtering)
+    -> bandpass 0.1-35 Hz FIR at the original rate (psg_utils apply_filtering)
     -> resample_poly to 128 Hz (model input rate)
     -> clip to +/- 20 x global IQR per channel
     -> per-channel RobustScaler (median/IQR, fit on the whole recording)
@@ -42,17 +44,20 @@ Label TXT layout (as in the training data): tab-separated
 """
 import argparse
 import json
-import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
-import pyedflib
-from mne.filter import filter_data
-from scipy.signal import resample_poly
-from sklearn.preprocessing import RobustScaler
+
+from bci2026_common import (
+    EPOCH_DURATION,
+    STAGE_NAMES,
+    load_hypnogram,
+    load_psg,
+    preprocess_psg,
+)
 
 try:  # torch is only needed for inference, not for --score-only
     import torch
@@ -64,123 +69,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]  # .../AnySleep
 # default checkpoint: the AnySleep run on the bci2026 data, saved into
 # bci2026_models/ next to the repo (outside it, i.e. in REPO_ROOT.parent).
 # NOTE: exp002a was trained on the old 3-channel (EEG, EOG-R, EOG-L) data
-# without the 0.5-16 Hz filter; pass --model with the checkpoint retrained
-# on the new prepare_bci2026.py data (EEG, M1, EOG-R + filter) once
+# without the bandpass filter; pass --model with the checkpoint retrained
+# on the new prepare_bci2026.py data (EEG, M1, EOG-R, EOG-L + filter) once
 # available, e.g. bci2026_models/exp00Xa-anysleep-<timestamp>-final.pth
 DEFAULT_MODEL = (
     REPO_ROOT.parent / "bci2026_models" / "exp002a-anysleep-2026-10-21_15-54-36-final.pth"
 )
-
-# model input channels, EEG group first then EOG (the same set and order as
-# the training data written by prepare_bci2026.py)
-EEG_CHANNELS = ["EEG", "M1"]
-EOG_CHANNELS = ["EOG-R"]
-# bandpass filter cutoffs (Hz), applied at the original sample rate before
-# resampling, as the psg_utils _load pipeline does (filtering.apply_filtering)
-FILTER_L_FREQ = 0.5
-FILTER_H_FREQ = 16
-SAMPLE_RATE = 128  # model input sample rate, Hz
-EPOCH_DURATION = 30  # sleep epoch duration, s
-MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold
-STAGE_MAP = {"W": 0, "N1": 1, "N2": 2, "N3": 3, "REM": 4}
-STAGE_NAMES = ["W", "N1", "N2", "N3", "REM"]
-
-
-def load_psg(edf_path):
-    """
-    Loads the EEG/EOG channels of an EDF file (physical values, calibrated
-    from the EDF header digital/physical min-max).
-
-    Returns:
-        psg:    float64 ndarray of shape [N, len(EEG_CHANNELS + EOG_CHANNELS)]
-        sfreq:  sample rate of the file, in Hz
-        start:  naive datetime of the recording start, from the EDF header
-    """
-    channels = EEG_CHANNELS + EOG_CHANNELS
-    f = pyedflib.EdfReader(str(edf_path))
-    try:
-        labels = [f.getLabel(i) for i in range(f.signals_in_file)]
-        duplicates = sorted(chan for chan in set(labels) if labels.count(chan) > 1)
-        if duplicates:
-            raise ValueError(
-                f"{edf_path}: duplicate channel labels {duplicates} ({labels})"
-            )
-        missing = [chan for chan in channels if chan not in labels]
-        if missing:
-            raise ValueError(
-                f"{edf_path}: channels {missing} not found in file ({labels})"
-            )
-        # load the channels in the requested order, independent of the file order
-        label_to_ind = {chan: i for i, chan in enumerate(labels)}
-        sfreqs = {
-            round(f.getSampleFrequency(label_to_ind[chan]), 10) for chan in channels
-        }
-        if len(sfreqs) != 1:
-            raise ValueError(
-                f"{edf_path}: selected channels have mixed/unknown sample rates: "
-                f"{sfreqs}"
-            )
-        sfreq = int(sfreqs.pop())
-        psg = np.stack([f.readSignal(label_to_ind[chan]) / 1.0e6 for chan in channels], axis=1)
-        start = f.getStartdatetime()
-    finally:
-        f.close()
-    if start is None or start.year < 1980:
-        raise ValueError(f"{edf_path}: EDF header has no valid start date/time")
-    return np.ascontiguousarray(psg, dtype=np.float64), sfreq, start
-
-
-def apply_filtering(psg, sfreq):
-    """
-    Bandpass-filters all channels between FILTER_L_FREQ and FILTER_H_FREQ.
-
-    Equivalent to psg_utils.preprocessing.filtering.apply_filtering with
-    {'l_freq': 0.5, 'h_freq': 16, 'method': 'fir'}: mne FIR filter on float64,
-    run at the original sample rate before resampling (the psg_utils _load
-    pipeline filters before set_psg_sample_rate).
-    """
-    return filter_data(
-        psg.T.astype(np.float64),
-        sfreq,
-        l_freq=FILTER_L_FREQ,
-        h_freq=FILTER_H_FREQ,
-        method="fir",
-    ).T.astype(psg.dtype)
-
-
-def preprocess_recording(psg, sfreq):
-    """
-    Trims to whole 30 s epochs, bandpass-filters 0.5-16 Hz at the original
-    rate, resamples to 128 Hz, clips to +/- 20 x IQR and robust-scales each
-    channel on the whole recording (training pipeline).
-
-    Returns:
-        psg:      float32 ndarray [n_epochs * SAMPLE_RATE * EPOCH_DURATION, C]
-        n_epochs: number of complete 30 s epochs
-    """
-    data_per_epoch = sfreq * EPOCH_DURATION
-    n_epochs = psg.shape[0] // data_per_epoch
-    if n_epochs == 0:
-        raise ValueError(f"recording shorter than one {EPOCH_DURATION} s epoch")
-    psg = psg[: n_epochs * data_per_epoch]
-
-    # bandpass filter at the original sample rate, before resampling
-    # (psg_utils applies filter_settings before set_psg_sample_rate)
-    psg = apply_filtering(psg, sfreq)
-
-    psg = resample_poly(psg, SAMPLE_RATE, sfreq, axis=0)
-
-    for chan in range(psg.shape[-1]):
-        chan_psg = psg[:, chan]
-        iqr = np.subtract(*np.percentile(chan_psg, [75, 25]))
-        threshold = iqr * MIN_MAX_TIMES_GLOBAL_IQR
-        psg[:, chan] = np.clip(chan_psg, -threshold, threshold)
-
-    for chan in range(psg.shape[-1]):
-        scaler = RobustScaler()  # with_centering=True, quantile_range (25, 75)
-        psg[:, chan] = scaler.fit_transform(psg[:, chan].reshape(-1, 1)).ravel()
-
-    return psg.astype(np.float32), n_epochs
 
 
 def predict_edf(model, edf_path, device):
@@ -192,7 +86,7 @@ def predict_edf(model, edf_path, device):
                   same encoding as the training labels)
     """
     psg, sfreq, start = load_psg(edf_path)
-    psg, n_epochs = preprocess_recording(psg, sfreq)
+    psg, n_epochs = preprocess_psg(psg, sfreq, edf_path.name)
     x = torch.from_numpy(psg).float().unsqueeze(0).to(device)  # (1, time, ch)
     with torch.no_grad():
         logits = model(x)  # (1, epochs, 5)
@@ -355,58 +249,6 @@ def postprocess_periods(periods):
     return rule_end_w(fixed)
 
 
-def load_hypnogram(txt_path):
-    """
-    Parses a label TXT into per-epoch sleep stage integers.
-
-    Expects tab-separated 'hh:mm:ss / stage / duration' rows of 30 s,
-    contiguous from the first row, aligned with the EDF start time.
-
-    Returns:
-        first_time: datetime of the first row
-        stages:     int64 ndarray of shape [n_epochs]
-    """
-    stages = []
-    first_time = None
-    expected_sec = None  # clock seconds of the next expected row
-    with open(txt_path, encoding="utf-8-sig") as f:
-        for line_no, line in enumerate(f, start=1):
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: expected 3 tab-separated fields, "
-                    f"got {line.rstrip()!r}"
-                )
-            time_str, stage_str, dur_str = (p.strip() for p in parts)
-            if first_time is None and not re.fullmatch(r"\d{2}:\d{2}:\d{2}", time_str):
-                continue  # header row
-            if stage_str not in STAGE_MAP:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: unknown stage {stage_str!r}, "
-                    f"expected one of {sorted(STAGE_MAP)}"
-                )
-            if int(dur_str) != EPOCH_DURATION:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: duration {dur_str} != {EPOCH_DURATION}"
-                )
-            sec = (
-                int(time_str[:2]) * 3600 + int(time_str[3:5]) * 60 + int(time_str[6:8])
-            )
-            if first_time is None:
-                first_time = datetime.strptime(time_str, "%H:%M:%S")
-                expected_sec = sec
-            elif sec != expected_sec % 86400:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: row time {time_str} does not continue "
-                    f"the previous rows"
-                )
-            stages.append(STAGE_MAP[stage_str])
-            expected_sec += EPOCH_DURATION
-    if first_time is None:
-        raise ValueError(f"{txt_path}: no label rows found")
-    return first_time, np.asarray(stages, dtype=np.int64)
-
-
 def print_metrics(y_true, y_pred):
     """
     Prints the competition metrics on pooled epochs:
@@ -476,12 +318,12 @@ def run_inference(args):
     device = args.device
     print(f"Model:   {args.model}")
     print(f"Device:  {device}")
-    # AnySleep consumes (batch, time, C) with the channels
-    # EEG_CHANNELS + EOG_CHANNELS above (EEG, M1, EOG-R; variable channel
-    # counts are handled by the attention on the skip connections) and
-    # outputs 5 logits per epoch in the repo's stage encoding
-    # (config/base_config.yaml data.stages: 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM),
-    # which is identical to STAGE_MAP, so the argmax labels need no remapping.
+    # AnySleep consumes (batch, time, C) with the 4 channels of
+    # bci2026_common (EEG, M1, EOG-R, EOG-L; variable channel counts are
+    # handled by the attention on the skip connections) and outputs 5 logits
+    # per epoch in the repo's stage encoding (config/base_config.yaml
+    # data.stages: 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM), which is identical to
+    # the training STAGE_MAP, so the argmax labels need no remapping.
     model = AnySleep(path=args.model, sleep_stage_frequency=1)
     model.eval().to(device)
 
