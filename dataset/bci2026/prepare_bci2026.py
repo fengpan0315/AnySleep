@@ -2,10 +2,13 @@
 Create the AnySleep training dataset 'bci2026' from the raw BCI recordings.
 
 Replicates the preprocessing pipeline of dslaborg/Sleep-Datasets (preprocess.py
-with the standard config/dataset settings) for the simple case of this dataset:
+with the standard config/dataset settings) for the simple case of this dataset;
+the shared loading and preprocessing code lives in bci2026_common.py (used by
+predict_bci2026.py as well):
 
     load PSG (channels already referenced, no montage creation)
     -> strip_to_match (trim PSG/hypnogram to common whole-epoch lengths)
+    -> bandpass 0.1-35 Hz FIR at the original rate       (psg_utils filtering)
     -> resample_poly(psg, 128, 250)                       (psg_utils psg_sampling)
     -> clip_noisy_values (clip to +/- 20x global IQR)      (quality_control_funcs)
     -> RobustScaler (per channel, fit on the whole record) (MultiChannelScaler)
@@ -15,13 +18,18 @@ Raw data (verified for all recordings):
     <subject>.edf  channels 'EEG', 'EOG-R', 'EOG-L', 'M1', 'ECG', 250 Hz
     <subject>.txt  tab-separated '时间 [hh:mm:ss] / 睡眠期 / 持续时间', 30 s rows,
                    stages W/N1/N2/N3/REM, first row aligned with the EDF start time
-M1 and ECG are not used (AnySleep only supports EEG/EOG channels).
+M1 is stored as a second EEG-group channel and EOG-L as a second EOG-group
+channel: the U-Sleep train sampler draws one random EEG ('EEG'/'M1') and one
+random EOG ('EOG-R'/'EOG-L') channel per window
+(base/data/usleep_train_dataset.py), the AnySleep train sampler a random
+subset of the combined channel pool (base/data/anysleep_train_dataset.py).
+ECG is not used.
 
 Outputs (next to this script):
     bci2026.h5          group 'bci2026' with one subgroup per recording, in the
                         structure expected by AnySleep (see base/data/base_dataset.py)
     bci2026_split.yaml  train/valid/test datasplit (prepare_splits.py semantics,
-                        seed=42, test 2%, valid 18%)
+                        seed=42, test 0%, valid 10%)
 
 Run with the anysleep conda env:
     python prepare_bci2026.py [--input-dir ...] [--overwrite] [--split-only]
@@ -30,27 +38,25 @@ import argparse
 import logging
 import math
 import os
-import re
-from datetime import datetime, timedelta
 from glob import glob
 
 import h5py
 import numpy as np
-import pyedflib
-from scipy.signal import resample_poly
-from sklearn.preprocessing import RobustScaler
+
+from bci2026_common import (
+    EEG_CHANNELS,
+    EOG_CHANNELS,
+    EPOCH_DURATION,
+    SAMPLE_RATE,
+    STAGE_MAP,
+    load_hypnogram,
+    load_psg,
+    preprocess_psg,
+)
 
 logger = logging.getLogger(__name__)
-logging.captureWarnings(True)
 
 DATASET_NAME = "bci2026"
-SAMPLE_RATE = 128  # output sample rate of the signals, in Hz
-EPOCH_DURATION = 30  # sleep epoch duration, in seconds
-EEG_CHANNELS = ["EEG"]
-EOG_CHANNELS = ["EOG-R"]
-# stage encoding of Sleep-Datasets (general.stages / general.rstages)
-STAGE_MAP = {"W": 0, "N1": 1, "N2": 2, "N3": 3, "REM": 4}
-MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold, see preprocess.yaml
 # split settings, see config/dataset/_base_dataset.yaml
 TEST_FRACTION = 0.00
 VALIDATION_FRACTION = 0.10
@@ -60,153 +66,25 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_INPUT_DIR = r"C:\Users\fpan\Desktop\2_有标签训练数据50例"
 
 
-def parse_hypno_file(txt_path):
-    """
-    Parses a label file into per-epoch sleep stage integers.
-
-    Validates that all rows are EPOCH_DURATION long, contiguous (row times
-    equal the first time plus the cumulative durations, modulo 24 h) and use
-    known stage names.
-
-    Returns:
-        first_time:   datetime of the first row
-        stages:       int ndarray of shape [n_epochs]
-    """
-    stages = []
-    first_time = None
-    expected_time = None  # next row's expected clock time
-    with open(txt_path, encoding="utf-8-sig") as f:
-        for line_no, line in enumerate(f, start=1):
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: expected 3 tab-separated fields, "
-                    f"got {line.rstrip()!r}"
-                )
-            time_str, stage_str, dur_str = parts
-            if first_time is None and not re.fullmatch(r"\d{2}:\d{2}:\d{2}", time_str.strip()):
-                logger.debug(f"Skipping header row in {os.path.basename(txt_path)}")
-                continue
-            try:
-                duration = int(dur_str)
-            except ValueError:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: non-integer duration {dur_str!r}"
-                )
-            time_ = datetime.strptime(time_str, "%H:%M:%S")
-            time_sec = timedelta(hours=time_.hour, minutes=time_.minute, seconds=time_.second)
-            if first_time is None:
-                first_time = time_
-                expected_time = time_sec
-            elif time_sec != expected_time:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: row time {time_str} does not "
-                    f"continue the previous rows (expected "
-                    f"{timedelta(seconds=expected_time.total_seconds() % 86400)})"
-                )
-            if duration != EPOCH_DURATION:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: duration {duration} != {EPOCH_DURATION}"
-                )
-            if stage_str not in STAGE_MAP:
-                raise ValueError(
-                    f"{txt_path}:{line_no}: unknown stage {stage_str!r}, "
-                    f"expected one of {sorted(STAGE_MAP)}"
-                )
-            stages.append(STAGE_MAP[stage_str])
-            expected_time = (time_sec + timedelta(seconds=duration)) % timedelta(days=1)
-    if first_time is None:
-        raise ValueError(f"{txt_path}: no label rows found")
-    return first_time, np.asarray(stages, dtype=np.int64)
-
-
-def load_psg(edf_path):
-    """
-    Loads the EEG/EOG channels of an EDF file.
-
-    Returns:
-        psg:    float64 ndarray of shape [N, len(EEG_CHANNELS + EOG_CHANNELS)]
-        sfreq:  sample rate of the file, in Hz
-        start:  datetime of the recording start
-    """
-    channels = EEG_CHANNELS + EOG_CHANNELS
-    f = pyedflib.EdfReader(edf_path)
-    try:
-        labels = [f.getLabel(i) for i in range(f.signals_in_file)]
-        duplicates = sorted(chan for chan in set(labels) if labels.count(chan) > 1)
-        if duplicates:
-            raise ValueError(
-                f"{edf_path}: duplicate channel labels {duplicates} ({labels})"
-            )
-        missing = [chan for chan in channels if chan not in labels]
-        if missing:
-            raise ValueError(
-                f"{edf_path}: channels {missing} not found in file ({labels})"
-            )
-        # load the channels in the requested order, independent of the file order
-        label_to_ind = {chan: i for i, chan in enumerate(labels)}
-        sfreqs = {
-            round(f.getSampleFrequency(label_to_ind[chan]), 10) for chan in channels
-        }
-        if len(sfreqs) != 1:
-            raise ValueError(
-                f"{edf_path}: selected channels have mixed/unknown sample rates: {sfreqs}"
-            )
-        sfreq = int(sfreqs.pop())
-        psg = np.stack([f.readSignal(label_to_ind[chan]) / 1.0e6 for chan in channels], axis=1)
-        start = f.getStartdatetime()
-    finally:
-        f.close()
-    return np.ascontiguousarray(psg, dtype=np.float64), sfreq, start
-
-
-def clip_noisy_values(psg, sample_rate, period_length_sec, subject):
-    """
-    Clips all values larger/smaller than +/- MIN_MAX_TIMES_GLOBAL_IQR times the
-    IQR of the whole channel, logging the affected epochs per channel.
-
-    Equivalent to psg_utils.preprocessing.quality_control_funcs.clip_noisy_values
-    with min_max_times_global_iqr=20 (preprocess.yaml default).
-    """
-    if np.any(~np.isfinite(psg)):
-        raise ValueError(f"{subject}: PSG contains NaN or infinite values")
-    n_periods = int(psg.shape[0] / (sample_rate * period_length_sec))
-    for chan in range(psg.shape[-1]):
-        chan_psg = psg[:, chan]
-        iqr = np.subtract(*np.percentile(chan_psg, [75, 25]))
-        threshold = iqr * MIN_MAX_TIMES_GLOBAL_IQR
-        temp_psg = chan_psg.reshape(n_periods, -1)
-        inds = np.unique(np.where(np.abs(temp_psg) > threshold)[0])
-        psg[:, chan] = np.clip(chan_psg, -threshold, threshold)
-        fraction = len(inds) / n_periods
-        msg = (
-            f"Quality control for '{subject}' affected {len(inds)}/{n_periods} "
-            f"epochs in channel {chan}"
-        )
-        logger.warning(msg) if fraction >= 0.15 else logger.debug(msg)
-
-
 def preprocess_recording(edf_path, txt_path, subject):
     """
-    Runs the full preprocessing pipeline for one recording.
+    Runs the full preprocessing pipeline (bci2026_common.preprocess_psg) for
+    one recording and aligns the hypnogram with the preprocessed PSG length
+    (strip_to_match: truncate / pad with UNKNOWN=9).
 
     Returns:
         psg:     float32 ndarray [n_epochs * SAMPLE_RATE * EPOCH_DURATION, C]
         stages:  int64 ndarray [n_epochs]
     """
     psg, sfreq, edf_start = load_psg(edf_path)
-    hypno_start, stages = parse_hypno_file(txt_path)
+    hypno_start, stages = load_hypnogram(txt_path)
     if edf_start.strftime("%H:%M:%S") != hypno_start.strftime("%H:%M:%S"):
         raise ValueError(
             f"{subject}: hypnogram starts at {hypno_start:%H:%M:%S} but the EDF "
             f"starts at {edf_start:%H:%M:%S}; the labels would be misaligned"
         )
 
-    # strip_to_match: trim the PSG to a length divisible by EPOCH_DURATION * sfreq
-    # and align the hypnogram length with it (pad with UNKNOWN=9 / truncate)
-    data_per_epoch = sfreq * EPOCH_DURATION
-    n_epochs = psg.shape[0] // data_per_epoch
-    psg = psg[: n_epochs * data_per_epoch]
+    psg, n_epochs = preprocess_psg(psg, sfreq, subject)
     if len(stages) > n_epochs:
         logger.info(f"{subject}: stripping hypnogram by {len(stages) - n_epochs} epochs")
         stages = stages[:n_epochs]
@@ -214,16 +92,7 @@ def preprocess_recording(edf_path, txt_path, subject):
         logger.info(f"{subject}: padding hypnogram with {n_epochs - len(stages)} UNKNOWN epochs")
         stages = np.pad(stages, (0, n_epochs - len(stages)), constant_values=9)
 
-    # resample to SAMPLE_RATE (psg_utils set_psg_sample_rate, poly method)
-    psg = resample_poly(psg, SAMPLE_RATE, sfreq, axis=0)
-
-    # quality control, then per-channel RobustScaler fit on the whole recording
-    clip_noisy_values(psg, SAMPLE_RATE, EPOCH_DURATION, subject)
-    for chan in range(psg.shape[-1]):
-        scaler = RobustScaler()  # with_centering=True, quantile_range (25, 75)
-        psg[:, chan] = scaler.fit_transform(psg[:, chan].reshape(-1, 1)).ravel()
-
-    return psg.astype(np.float32), stages
+    return psg, stages
 
 
 def write_subject(h5_dataset_group, subject, psg, stages):
@@ -372,4 +241,5 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="[%(asctime)s][%(levelname)s][%(module)s:%(lineno)d] - %(message)s",
     )
+    logging.captureWarnings(True)
     main()
