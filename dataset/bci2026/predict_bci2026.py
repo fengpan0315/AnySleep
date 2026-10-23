@@ -2,7 +2,7 @@
 Batch sleep-stage inference for the BCI 2026 competition.
 
 Reads every EDF file from a (read-only) input directory, predicts one sleep
-stage per 30 s epoch with the U-Sleep model (2-channel EEG + EOG input), and
+stage per 30 s epoch with the AnySleep model (EEG + M1 + EOG-R input), and
 writes one same-named UTF-8 JSON file per EDF into the output directory:
 
     {"Sleep": [{"time": "2026-01-01 23:59:30", "period": 0}, ...]}
@@ -19,13 +19,12 @@ postprocess_periods), enabled by default; --no-postprocess skips it.
 
 Preprocessing (identical to prepare_bci2026.py and the training pipeline,
 same as examples/predict_edf_file_logits_plain.py):
-    EEG + EOG-R read via pyedflib (physical calibration from the EDF
-    header; the signals are already 0.1-35 Hz bandpassed and 50 Hz notched;
-    M1 and ECG are not used, and EOG-L is available in the EDFs but not
-    loaded: U-Sleep takes exactly 2 channels, EEG first and EOG second,
-    the same pair as the exp001a U-Sleep training data in
-    prepare_bci2026.py)
+    EEG + M1 + EOG-R read via pyedflib (physical calibration from the EDF
+    header; EEG and M1 form the EEG group and EOG-R the EOG group, the
+    same set and order as the training data written by prepare_bci2026.py;
+    EOG-L and ECG are not used)
     -> trim to whole 30 s epochs from the EDF start
+    -> bandpass 0.5-16 Hz FIR at the original rate (psg_utils apply_filtering)
     -> resample_poly to 128 Hz (model input rate)
     -> clip to +/- 20 x global IQR per channel
     -> per-channel RobustScaler (median/IQR, fit on the whole recording)
@@ -51,6 +50,7 @@ from pathlib import Path
 
 import numpy as np
 import pyedflib
+from mne.filter import filter_data
 from scipy.signal import resample_poly
 from sklearn.preprocessing import RobustScaler
 
@@ -61,15 +61,24 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parents[2]  # .../AnySleep
 
-# default checkpoint: the U-Sleep model published with the repo (the same
-# weights used by examples/anphy/predict_anphy_usleep.py). Pass --model to
-# use another U-Sleep checkpoint, e.g. a bci2026-trained one saved into
-# bci2026_models/ next to the repo as exp001a-usleep-<timestamp>-final.pth
-DEFAULT_MODEL = REPO_ROOT.parent / "bci2026_models" / "exp001a-usleep-2026-10-23_10-52-18-final.pth"
+# default checkpoint: the AnySleep run on the bci2026 data, saved into
+# bci2026_models/ next to the repo (outside it, i.e. in REPO_ROOT.parent).
+# NOTE: exp002a was trained on the old 3-channel (EEG, EOG-R, EOG-L) data
+# without the 0.5-16 Hz filter; pass --model with the checkpoint retrained
+# on the new prepare_bci2026.py data (EEG, M1, EOG-R + filter) once
+# available, e.g. bci2026_models/exp00Xa-anysleep-<timestamp>-final.pth
+DEFAULT_MODEL = (
+    REPO_ROOT.parent / "bci2026_models" / "exp002a-anysleep-2026-10-21_15-54-36-final.pth"
+)
 
-# U-Sleep input: exactly 2 channels, (EEG, EOG) in this order
-EEG_CHANNELS = ["EEG"]
+# model input channels, EEG group first then EOG (the same set and order as
+# the training data written by prepare_bci2026.py)
+EEG_CHANNELS = ["EEG", "M1"]
 EOG_CHANNELS = ["EOG-R"]
+# bandpass filter cutoffs (Hz), applied at the original sample rate before
+# resampling, as the psg_utils _load pipeline does (filtering.apply_filtering)
+FILTER_L_FREQ = 0.5
+FILTER_H_FREQ = 16
 SAMPLE_RATE = 128  # model input sample rate, Hz
 EPOCH_DURATION = 30  # sleep epoch duration, s
 MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold
@@ -121,10 +130,29 @@ def load_psg(edf_path):
     return np.ascontiguousarray(psg, dtype=np.float64), sfreq, start
 
 
+def apply_filtering(psg, sfreq):
+    """
+    Bandpass-filters all channels between FILTER_L_FREQ and FILTER_H_FREQ.
+
+    Equivalent to psg_utils.preprocessing.filtering.apply_filtering with
+    {'l_freq': 0.5, 'h_freq': 16, 'method': 'fir'}: mne FIR filter on float64,
+    run at the original sample rate before resampling (the psg_utils _load
+    pipeline filters before set_psg_sample_rate).
+    """
+    return filter_data(
+        psg.T.astype(np.float64),
+        sfreq,
+        l_freq=FILTER_L_FREQ,
+        h_freq=FILTER_H_FREQ,
+        method="fir",
+    ).T.astype(psg.dtype)
+
+
 def preprocess_recording(psg, sfreq):
     """
-    Trims to whole 30 s epochs, resamples to 128 Hz, clips to +/- 20 x IQR and
-    robust-scales each channel on the whole recording (training pipeline).
+    Trims to whole 30 s epochs, bandpass-filters 0.5-16 Hz at the original
+    rate, resamples to 128 Hz, clips to +/- 20 x IQR and robust-scales each
+    channel on the whole recording (training pipeline).
 
     Returns:
         psg:      float32 ndarray [n_epochs * SAMPLE_RATE * EPOCH_DURATION, C]
@@ -135,6 +163,10 @@ def preprocess_recording(psg, sfreq):
     if n_epochs == 0:
         raise ValueError(f"recording shorter than one {EPOCH_DURATION} s epoch")
     psg = psg[: n_epochs * data_per_epoch]
+
+    # bandpass filter at the original sample rate, before resampling
+    # (psg_utils applies filter_settings before set_psg_sample_rate)
+    psg = apply_filtering(psg, sfreq)
 
     psg = resample_poly(psg, SAMPLE_RATE, sfreq, axis=0)
 
@@ -434,22 +466,23 @@ def run_inference(args):
 
     sys.path.insert(0, str(REPO_ROOT / "examples"))
     try:
-        from usleep_no_hydra import USleep
+        from anysleep_no_hydra import AnySleep
     except ImportError:
         sys.exit(
-            f"error: cannot import usleep_no_hydra; expected at "
-            f"{REPO_ROOT / 'examples' / 'usleep_no_hydra.py'}"
+            f"error: cannot import anysleep_no_hydra; expected at "
+            f"{REPO_ROOT / 'examples' / 'anysleep_no_hydra.py'}"
         )
 
     device = args.device
     print(f"Model:   {args.model}")
     print(f"Device:  {device}")
-    # U-Sleep consumes (batch, time, 2) with the 2 channels EEG + EOG
-    # (EEG_CHANNELS + EOG_CHANNELS above) and outputs 5 logits per epoch in
-    # the repo's stage encoding (config/base_config.yaml data.stages:
-    # 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM), which is identical to STAGE_MAP, so
-    # the argmax labels need no remapping.
-    model = USleep(path=args.model, sleep_stage_frequency=1)
+    # AnySleep consumes (batch, time, C) with the channels
+    # EEG_CHANNELS + EOG_CHANNELS above (EEG, M1, EOG-R; variable channel
+    # counts are handled by the attention on the skip connections) and
+    # outputs 5 logits per epoch in the repo's stage encoding
+    # (config/base_config.yaml data.stages: 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM),
+    # which is identical to STAGE_MAP, so the argmax labels need no remapping.
+    model = AnySleep(path=args.model, sleep_stage_frequency=1)
     model.eval().to(device)
 
     input_dir = Path(args.input_dir)
@@ -536,7 +569,7 @@ def main():
     )
     parser.add_argument("--input-dir", default="/input", help="read-only EDF directory")
     parser.add_argument("--output-dir", default="/output", help="JSON output directory")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="U-Sleep checkpoint")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="AnySleep checkpoint")
     parser.add_argument("--device", default="cpu", help="cuda or cpu (default: cpu)")
     parser.add_argument(
         "--truth-dir",

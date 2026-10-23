@@ -18,7 +18,7 @@ data:
       _target_: base.data.anysleep_train_dataset.AnySleepTrainDataset
       h5_path: ${data.path}
       window_size: 35
-      num_of_samples: 28571 # Approximated from Steps per Epoch = 443 ( amounts to roughly 10^6 30s Segments)
+      num_of_samples: 10000 # Approximated from Steps per Epoch = 443 ( amounts to roughly 10^6 30s Segments)
       # For T = 35 this would be 10^6 / 35 approx 28571
       batch_size: 64
   earlystopping_dataloader:

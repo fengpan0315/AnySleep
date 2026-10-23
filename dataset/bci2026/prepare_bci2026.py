@@ -6,6 +6,7 @@ with the standard config/dataset settings) for the simple case of this dataset:
 
     load PSG (channels already referenced, no montage creation)
     -> strip_to_match (trim PSG/hypnogram to common whole-epoch lengths)
+    -> bandpass 0.5-16 Hz FIR at the original rate       (psg_utils filtering)
     -> resample_poly(psg, 128, 250)                       (psg_utils psg_sampling)
     -> clip_noisy_values (clip to +/- 20x global IQR)      (quality_control_funcs)
     -> RobustScaler (per channel, fit on the whole record) (MultiChannelScaler)
@@ -15,7 +16,9 @@ Raw data (verified for all recordings):
     <subject>.edf  channels 'EEG', 'EOG-R', 'EOG-L', 'M1', 'ECG', 250 Hz
     <subject>.txt  tab-separated '时间 [hh:mm:ss] / 睡眠期 / 持续时间', 30 s rows,
                    stages W/N1/N2/N3/REM, first row aligned with the EDF start time
-M1 and ECG are not used (AnySleep only supports EEG/EOG channels).
+M1 is stored as a second EEG-group channel: the U-Sleep train sampler draws
+one random EEG ('EEG' or 'M1') and one random EOG channel per window
+(base/data/usleep_train_dataset.py). EOG-L and ECG are not used.
 
 Outputs (next to this script):
     bci2026.h5          group 'bci2026' with one subgroup per recording, in the
@@ -36,6 +39,7 @@ from glob import glob
 
 import h5py
 import numpy as np
+from mne.filter import filter_data
 import pyedflib
 from scipy.signal import resample_poly
 from sklearn.preprocessing import RobustScaler
@@ -46,8 +50,12 @@ logging.captureWarnings(True)
 DATASET_NAME = "bci2026"
 SAMPLE_RATE = 128  # output sample rate of the signals, in Hz
 EPOCH_DURATION = 30  # sleep epoch duration, in seconds
-EEG_CHANNELS = ["EEG"]
+EEG_CHANNELS = ["EEG", "M1"]
 EOG_CHANNELS = ["EOG-R"]
+# bandpass filter cutoffs (Hz), applied at the original sample rate before
+# resampling, as the psg_utils _load pipeline does (filtering.apply_filtering)
+FILTER_L_FREQ = 0.5
+FILTER_H_FREQ = 16
 # stage encoding of Sleep-Datasets (general.stages / general.rstages)
 STAGE_MAP = {"W": 0, "N1": 1, "N2": 2, "N3": 3, "REM": 4}
 MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold, see preprocess.yaml
@@ -160,6 +168,24 @@ def load_psg(edf_path):
     return np.ascontiguousarray(psg, dtype=np.float64), sfreq, start
 
 
+def apply_filtering(psg, sfreq):
+    """
+    Bandpass-filters all channels between FILTER_L_FREQ and FILTER_H_FREQ.
+
+    Equivalent to psg_utils.preprocessing.filtering.apply_filtering with
+    {'l_freq': 0.5, 'h_freq': 16, 'method': 'fir'}: mne FIR filter on float64,
+    run at the original sample rate before resampling (the psg_utils _load
+    pipeline filters before set_psg_sample_rate).
+    """
+    return filter_data(
+        psg.T.astype(np.float64),
+        sfreq,
+        l_freq=FILTER_L_FREQ,
+        h_freq=FILTER_H_FREQ,
+        method="fir",
+    ).T.astype(psg.dtype)
+
+
 def clip_noisy_values(psg, sample_rate, period_length_sec, subject):
     """
     Clips all values larger/smaller than +/- MIN_MAX_TIMES_GLOBAL_IQR times the
@@ -213,6 +239,10 @@ def preprocess_recording(edf_path, txt_path, subject):
     elif len(stages) < n_epochs:
         logger.info(f"{subject}: padding hypnogram with {n_epochs - len(stages)} UNKNOWN epochs")
         stages = np.pad(stages, (0, n_epochs - len(stages)), constant_values=9)
+
+    # bandpass filter at the original sample rate, before resampling
+    # (psg_utils applies filter_settings before set_psg_sample_rate)
+    psg = apply_filtering(psg, sfreq)
 
     # resample to SAMPLE_RATE (psg_utils set_psg_sample_rate, poly method)
     psg = resample_poly(psg, SAMPLE_RATE, sfreq, axis=0)
