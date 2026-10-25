@@ -2,9 +2,9 @@
 Batch sleep-stage inference for the BCI 2026 competition.
 
 Reads every EDF file from a (read-only) input directory, predicts one sleep
-stage per 30 s epoch with the AnySleep model (EEG + M1 + EOG-R + EOG-L input),
-and
-writes one same-named UTF-8 JSON file per EDF into the output directory:
+stage per 30 s epoch with the AnySleep model (EEG-M1, EOG-R-M1, EOG-L-M1
+input), and writes one same-named UTF-8 JSON file per EDF into the output
+directory:
 
     {"Sleep": [{"time": "2026-01-01 23:59:30", "period": 0}, ...]}
 
@@ -16,17 +16,17 @@ Each EDF is processed completely independently: channels are selected per
 file and the whole recording is preprocessed on its own. No model state,
 no trimming, and no statistics are carried across records. The raw argmax
 hypnograms are then repaired by rule-based post-processing (see
-postprocess_periods), enabled by default; --no-postprocess skips it.
+postprocess_periods).
 
 Preprocessing (identical to the training pipeline, shared with
 prepare_bci2026.py in bci2026_common.py, same as
 examples/predict_edf_file_logits_plain.py):
-    EEG + M1 + EOG-R + EOG-L read via pyedflib (physical calibration from
-    the EDF header; EEG and M1 form the EEG group and EOG-R and EOG-L the
-    EOG group, the same set and order as the training data written by
-    prepare_bci2026.py; ECG is not used)
+    EEG, EOG-R, EOG-L and the M1 reference read via pyedflib (physical
+    calibration from the EDF header), every channel re-referenced against
+    M1: EEG-M1, EOG-R-M1, EOG-L-M1 (the same set and order as the training
+    data written by prepare_bci2026.py; ECG is not used)
     -> trim to whole 30 s epochs from the EDF start
-    -> bandpass 0.1-35 Hz FIR at the original rate (psg_utils apply_filtering)
+    -> bandpass 0.5-16 Hz FIR at the original rate (psg_utils apply_filtering)
     -> resample_poly to 128 Hz (model input rate)
     -> clip to +/- 20 x global IQR per channel
     -> per-channel RobustScaler (median/IQR, fit on the whole recording)
@@ -68,35 +68,81 @@ REPO_ROOT = Path(__file__).resolve().parents[2]  # .../AnySleep
 
 # default checkpoint: the AnySleep run on the bci2026 data, saved into
 # bci2026_models/ next to the repo (outside it, i.e. in REPO_ROOT.parent).
-# NOTE: exp002a was trained on the old 3-channel (EEG, EOG-R, EOG-L) data
-# without the bandpass filter; pass --model with the checkpoint retrained
-# on the new prepare_bci2026.py data (EEG, M1, EOG-R, EOG-L + filter) once
-# available, e.g. bci2026_models/exp00Xa-anysleep-<timestamp>-final.pth
+# NOTE: exp002a was trained on the old unreferenced data (raw EEG, M1 and
+# EOG-R channels); this pipeline now feeds M1-referenced channels (EEG-M1,
+# EOG-R-M1, EOG-L-M1), so pass --model with a checkpoint retrained on the
+# new prepare_bci2026.py data once available, e.g.
+# bci2026_models/exp00Xa-anysleep-<timestamp>-final.pth
 DEFAULT_MODEL = (
     REPO_ROOT.parent / "bci2026_models" / "exp002a-anysleep-2026-10-23_15-45-01-final.pth"
 )
 
 
-def predict_edf(model, edf_path, device):
+def predict_edf(model, edf_path, device, logit_bias=None):
     """Runs the model on one EDF file, using its whole recording as context.
+
+    Args:
+        logit_bias: optional len-5 additive bias on the class logits
+            (W, N1, N2, N3, REM), applied before the argmax.
 
     Returns:
         start:    recording start datetime (EDF header)
         periods:  int ndarray [n_epochs], W=0 .. REM=4 (model class order,
                   same encoding as the training labels)
+        logits:   float ndarray [n_epochs, 5] (before any bias)
     """
     psg, sfreq, start = load_psg(edf_path)
     psg, n_epochs = preprocess_psg(psg, sfreq, edf_path.name)
     x = torch.from_numpy(psg).float().unsqueeze(0).to(device)  # (1, time, ch)
     with torch.no_grad():
         logits = model(x)  # (1, epochs, 5)
-    periods = logits[0].argmax(dim=1).cpu().numpy().astype(np.int64)
+    logits = logits[0].float().cpu().numpy()
+    biased = logits if logit_bias is None else logits + np.asarray(logit_bias)
+    periods = biased.argmax(axis=1).astype(np.int64)
     if len(periods) != n_epochs:
         raise ValueError(
             f"{edf_path}: model returned {len(periods)} predictions for "
             f"{n_epochs} epochs"
         )
-    return start, periods
+    return start, periods, logits
+
+
+def rule_n1_flip(periods, logits, margin=0.5):
+    """Flips W/N2/REM-edge epochs to N1 when the N1 logit is within `margin`
+    of the predicted class. Mined on the 45 training records
+    (mine_n1_rules.py): the model systematically under-predicts N1, and
+    near-tie epochs at W-run edges and around REM runs are true N1 ~50% of
+    the time in-sample (rule precision 0.63 on train, 0.14 on the 5 val
+    records, but the flips are cheap: +0.46 competition score with the
+    logit bias below, all parameters selected on train only)."""
+    periods = periods.copy()
+    n = len(periods)
+    prev = np.roll(periods, 1)
+    nxt = np.roll(periods, -1)
+    prev[0], nxt[-1] = -1, -1
+    top = logits[np.arange(n), periods]
+    for i in range(n):
+        p = periods[i]
+        edge = (
+            (p == 0 and not (prev[i] == 0 and nxt[i] == 0))  # w_edge
+            or (p == 2 and (prev[i] == 4 or nxt[i] == 4))    # n2_rem
+            or (p == 4 and (prev[i] in (0, 2) or nxt[i] in (0, 2)))  # rem_edge
+        )
+        if edge and p != 1 and logits[i, 1] >= top[i] - margin:
+            periods[i] = 1
+    return periods
+
+
+def rule_rem_to_w(periods, logits, margin=0.5):
+    """Flips predicted-REM epochs to W when the W logit is within `margin`.
+    W and REM share low-amplitude mixed-frequency EEG, so the model's
+    near-ties between them are mostly W (78-87% on both the 45 train and
+    5 val records, mine_rem_rules.py); +0.16/+0.17 score respectively."""
+    periods = periods.copy()
+    for i in range(len(periods)):
+        if periods[i] == 4 and logits[i, 0] >= logits[i, 4] - margin:
+            periods[i] = 0
+    return periods
 
 
 def write_prediction_json(out_path, start, periods):
@@ -318,9 +364,9 @@ def run_inference(args):
     device = args.device
     print(f"Model:   {args.model}")
     print(f"Device:  {device}")
-    # AnySleep consumes (batch, time, C) with the 4 channels of
-    # bci2026_common (EEG, M1, EOG-R, EOG-L; variable channel counts are
-    # handled by the attention on the skip connections) and outputs 5 logits
+    # AnySleep consumes (batch, time, C) with the 3 channels of
+    # bci2026_common (EEG-M1, EOG-R-M1, EOG-L-M1; variable channel counts
+    # are handled by the attention on the skip connections) and outputs 5 logits
     # per epoch in the repo's stage encoding (config/base_config.yaml
     # data.stages: 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM), which is identical to
     # the training STAGE_MAP, so the argmax labels need no remapping.
@@ -342,15 +388,21 @@ def run_inference(args):
     print(f"Output:  {output_dir}\n")
 
     t_total = time.perf_counter()
+    logit_bias = [0.0, 0.4, 0.0, 0.0, -0.4]
     for i, edf_path in enumerate(edf_files, start=1):
         print(f"[{i}/{len(edf_files)}] {edf_path.name}")
         t_file = time.perf_counter()
-        start, periods = predict_edf(model, edf_path, device)
+        start, periods, logits = predict_edf(model, edf_path, device, logit_bias)
         n_post = 0
-        if not args.no_postprocess:
-            fixed = postprocess_periods(periods)
-            n_post = int((fixed != periods).sum())
-            periods = fixed
+        fixed = postprocess_periods(periods)
+        n_post += int((fixed != periods).sum())
+        periods = fixed
+        fixed = rule_n1_flip(periods, logits + np.asarray(logit_bias))
+        n_post += int((fixed != periods).sum())
+        periods = fixed
+        fixed = rule_rem_to_w(periods, logits + np.asarray(logit_bias))
+        n_post += int((fixed != periods).sum())
+        periods = fixed
         out_path = output_dir / (edf_path.stem + ".json")
         write_prediction_json(out_path, start, periods)
         elapsed = time.perf_counter() - t_file
@@ -422,11 +474,6 @@ def main():
         "--score-only",
         action="store_true",
         help="skip inference, only score existing output JSONs (needs --truth-dir)",
-    )
-    parser.add_argument(
-        "--no-postprocess",
-        action="store_true",
-        help="write raw model predictions, skip the default rule-based repairs",
     )
     parser.add_argument(
         "--limit",

@@ -6,9 +6,10 @@ with the standard config/dataset settings) for the simple case of this dataset;
 the shared loading and preprocessing code lives in bci2026_common.py (used by
 predict_bci2026.py as well):
 
-    load PSG (channels already referenced, no montage creation)
+    load PSG, re-reference every channel against M1 (EEG-M1, EOG-R-M1,
+    EOG-L-M1)
     -> strip_to_match (trim PSG/hypnogram to common whole-epoch lengths)
-    -> bandpass 0.1-35 Hz FIR at the original rate       (psg_utils filtering)
+    -> bandpass 0.5-16 Hz FIR at the original rate        (psg_utils filtering)
     -> resample_poly(psg, 128, 250)                       (psg_utils psg_sampling)
     -> clip_noisy_values (clip to +/- 20x global IQR)      (quality_control_funcs)
     -> RobustScaler (per channel, fit on the whole record) (MultiChannelScaler)
@@ -18,12 +19,13 @@ Raw data (verified for all recordings):
     <subject>.edf  channels 'EEG', 'EOG-R', 'EOG-L', 'M1', 'ECG', 250 Hz
     <subject>.txt  tab-separated '时间 [hh:mm:ss] / 睡眠期 / 持续时间', 30 s rows,
                    stages W/N1/N2/N3/REM, first row aligned with the EDF start time
-M1 is stored as a second EEG-group channel and EOG-L as a second EOG-group
-channel: the U-Sleep train sampler draws one random EEG ('EEG'/'M1') and one
-random EOG ('EOG-R'/'EOG-L') channel per window
-(base/data/usleep_train_dataset.py), the AnySleep train sampler a random
-subset of the combined channel pool (base/data/anysleep_train_dataset.py).
-ECG is not used.
+All PSG channels are re-referenced against M1: the stored channels are EEG-M1
+('EEG'), EOG-R-M1 ('EOG-R') and EOG-L-M1 ('EOG-L'); the U-Sleep train
+sampler draws one random EEG ('EEG') and one random EOG ('EOG-R'/'EOG-L')
+channel per window (base/data/usleep_train_dataset.py), the AnySleep train
+sampler a random subset of the combined channel pool
+(base/data/anysleep_train_dataset.py). M1 itself and ECG are not model
+inputs.
 
 Outputs (next to this script):
     bci2026.h5          group 'bci2026' with one subgroup per recording, in the

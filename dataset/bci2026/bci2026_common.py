@@ -8,6 +8,7 @@ standard config/dataset settings) for this dataset, and matches
 examples/predict_edf_file_logits_plain.py:
 
     load PSG via pyedflib (physical calibration from the EDF header)
+    -> re-reference every channel against M1: EEG-M1, EOG-R-M1, EOG-L-M1
     -> trim to whole EPOCH_DURATION epochs from the EDF start
     -> bandpass FIR between FILTER_L_FREQ and FILTER_H_FREQ at the original
        sample rate, before resampling               (psg_utils filtering)
@@ -34,14 +35,16 @@ from sklearn.preprocessing import RobustScaler
 
 logger = logging.getLogger(__name__)
 
-# input channels, EEG group first then EOG; M1 is a second EEG-group channel
-# and EOG-L a second EOG-group channel: the U-Sleep train sampler draws one
-# random EEG ('EEG'/'M1') and one random EOG ('EOG-R'/'EOG-L') channel per
-# window (base/data/usleep_train_dataset.py), the AnySleep train sampler a
-# random subset of the combined channel pool (base/data/anysleep_train_dataset.py).
-# ECG is not used.
-EEG_CHANNELS = ["EEG", "M1"]
-EOG_CHANNELS = ["EOG-R"]
+# input channels after re-referencing against M1, EEG group first then EOG;
+# the U-Sleep train sampler draws one random EEG ('EEG') and one random EOG
+# ('EOG-R'/'EOG-L') channel per window (base/data/usleep_train_dataset.py),
+# the AnySleep train sampler a random subset of the combined channel pool
+# (base/data/anysleep_train_dataset.py). ECG is not used.
+EEG_CHANNELS = ["EEG"]
+EOG_CHANNELS = ["EOG-R", "EOG-L"]
+# raw reference channel subtracted from every input channel at load time;
+# M1 itself is not a model input
+REFERENCE_CHANNEL = "M1"
 SAMPLE_RATE = 128  # output sample rate of the signals, in Hz
 EPOCH_DURATION = 30  # sleep epoch duration, in seconds
 # bandpass filter cutoffs (Hz), applied at the original sample rate before
@@ -57,7 +60,8 @@ MIN_MAX_TIMES_GLOBAL_IQR = 20  # quality control threshold, see preprocess.yaml
 def load_psg(edf_path):
     """
     Loads the EEG/EOG channels of an EDF file (physical values, calibrated
-    from the EDF header digital/physical min-max).
+    from the EDF header digital/physical min-max) and re-references them
+    against M1: the returned columns are EEG-M1, EOG-R-M1 and EOG-L-M1.
 
     Returns:
         psg:    float64 ndarray of shape [N, len(EEG_CHANNELS + EOG_CHANNELS)]
@@ -65,6 +69,7 @@ def load_psg(edf_path):
         start:  naive datetime of the recording start, from the EDF header
     """
     channels = EEG_CHANNELS + EOG_CHANNELS
+    read_channels = channels + [REFERENCE_CHANNEL]
     f = pyedflib.EdfReader(str(edf_path))
     try:
         labels = [f.getLabel(i) for i in range(f.signals_in_file)]
@@ -73,7 +78,7 @@ def load_psg(edf_path):
             raise ValueError(
                 f"{edf_path}: duplicate channel labels {duplicates} ({labels})"
             )
-        missing = [chan for chan in channels if chan not in labels]
+        missing = [chan for chan in read_channels if chan not in labels]
         if missing:
             raise ValueError(
                 f"{edf_path}: channels {missing} not found in file ({labels})"
@@ -81,7 +86,8 @@ def load_psg(edf_path):
         # load the channels in the requested order, independent of the file order
         label_to_ind = {chan: i for i, chan in enumerate(labels)}
         sfreqs = {
-            round(f.getSampleFrequency(label_to_ind[chan]), 10) for chan in channels
+            round(f.getSampleFrequency(label_to_ind[chan]), 10)
+            for chan in read_channels
         }
         if len(sfreqs) != 1:
             raise ValueError(
@@ -89,7 +95,12 @@ def load_psg(edf_path):
                 f"{sfreqs}"
             )
         sfreq = int(sfreqs.pop())
-        psg = np.stack([f.readSignal(label_to_ind[chan]) / 1.0e6 for chan in channels], axis=1)
+        raw = {
+            chan: f.readSignal(label_to_ind[chan]) / 1.0e6 for chan in read_channels
+        }
+        # re-reference every input channel against M1
+        ref = raw[REFERENCE_CHANNEL]
+        psg = np.stack([raw[chan] - ref for chan in channels], axis=1)
         start = f.getStartdatetime()
     finally:
         f.close()
@@ -164,9 +175,9 @@ def apply_filtering(psg, sfreq):
     Bandpass-filters all channels between FILTER_L_FREQ and FILTER_H_FREQ.
 
     Equivalent to psg_utils.preprocessing.filtering.apply_filtering with
-    {'l_freq': 0.1, 'h_freq': 35, 'method': 'fir'}: mne FIR filter on float64,
-    run at the original sample rate before resampling (the psg_utils _load
-    pipeline filters before set_psg_sample_rate).
+    {'l_freq': FILTER_L_FREQ, 'h_freq': FILTER_H_FREQ, 'method': 'fir'}: mne
+    FIR filter on float64, run at the original sample rate before resampling
+    (the psg_utils _load pipeline filters before set_psg_sample_rate).
     """
     return filter_data(
         psg.T.astype(np.float64),
